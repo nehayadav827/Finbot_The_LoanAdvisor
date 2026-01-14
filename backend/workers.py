@@ -1,0 +1,324 @@
+import json
+from utils import (
+    calculate_final_interest_rate,
+    compute_emi,
+    calculate_foir,
+    generate_sanction_pdf
+)
+
+import os
+import json
+from google import genai
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+model="gemini-2.0-flash"
+# import os
+# import json
+
+BASE_DIR = os.path.dirname(__file__)
+CRM_PATH = os.path.join(BASE_DIR, "mock_crm.json")
+
+with open(CRM_PATH) as f:
+    CRM = json.load(f)
+
+
+# ---------------- SALES AGENT ----------------
+import random
+
+FIELD_LABELS = {
+    "loan_amount": "loan amount",
+    "tenure_months": "loan tenure",
+    "purpose": "loan purpose",
+    "salary": "monthly salary",
+    "phone": "phone number",
+    "pan": "PAN number"
+}
+
+FIELD_ORDER = [
+    "loan_amount",
+    "tenure_months",
+    "purpose",
+    "salary",
+    "salary_slip_uploaded",
+    "phone",
+    "pan"
+]
+
+ACK_MESSAGES = {
+    "loan_amount": [
+        "Got it 👍 Loan amount noted.",
+        "Thanks, I’ve noted the loan amount.",
+    ],
+    "tenure_months": [
+        "Perfect, tenure noted.",
+        "Great, I’ve captured the loan duration.",
+    ],
+    "purpose": [
+        "Understood. Loan purpose noted.",
+        "Thanks for sharing the purpose.",
+    ],
+    "salary": [
+        "Thanks 👍 Salary details noted.",
+        "Got it, income recorded.",
+    ],
+    "salary_slip_uploaded" :[
+        "Thanks, salary slip received.",
+        "Salary slip uploaded successfully."
+    ],
+    "phone": [
+        "Phone number noted.",
+        "Thanks, I’ve saved your contact number.",
+    ],
+    "pan": [
+        "PAN received. Thanks!",
+        "Great, PAN noted successfully.",
+    ]
+}
+
+
+ASK_MESSAGES = {
+    "loan_amount": [
+        "May I know how much loan amount you’re looking for?",
+        "What loan amount should I consider for you?"
+    ],
+    "tenure_months": [
+        "For how many months would you like to take this loan?",
+        "What repayment duration are you comfortable with?"
+    ],
+    "purpose": [
+        "What will you be using this loan for?",
+        "Could you tell me the purpose of the loan?"
+    ],
+    "salary": [
+        "To proceed, I’ll need your monthly salary.",
+        "May I know your monthly income?"
+    ],
+    "salary_slip_uploaded" : [
+        "Please upload your salary slip to continue.",
+        "I’ll need your salary slip for verification. Kindly upload it."
+    ],
+    "phone": [
+        "Please share your registered mobile number.",
+        "Could you provide your phone number?"
+    ],
+    "pan": [
+        "Lastly, may I have your PAN number?",
+        "Please share your PAN to complete verification."
+    ]
+}
+
+
+APPROVAL_MESSAGES = [
+    (
+        "🎉 That’s great news!\n\n"
+        "I’ve carefully reviewed your details, and I’m happy to let you know that your loan has been approved. "
+        "Your profile meets all our eligibility criteria, and everything looks good from our side. "
+        "You can now go ahead and download your sanction letter below."
+    ),
+    (
+        "✅ Congratulations!\n\n"
+        "Based on your income, credit profile, and loan requirements, we’re pleased to approve your loan. "
+        "This decision ensures a comfortable repayment plan while keeping your finances balanced. "
+        "Please find your official sanction letter attached."
+    ),
+    (
+        "🎊 Good news!\n\n"
+        "Your loan application has been successfully approved after a thorough evaluation. "
+        "We’ve ensured that the EMI fits well within your income, so repayments stay stress-free. "
+        "You can download your sanction letter and proceed with confidence."
+    ),
+    (
+        "😊 Happy to share an update!\n\n"
+        "Everything checks out perfectly, and your loan is now approved. "
+        "It was a pleasure assisting you through this process. "
+        "Your sanction letter is ready for download below."
+    )
+]
+
+# async def sales_agent(session: dict):
+#     last_asked = session.get("last_asked_field")
+
+#     # ✅ Acknowledge ONLY the last asked field
+#     acknowledgement = ""
+#     if last_asked and session.get(last_asked):
+#         acknowledgement = random.choice(ACK_MESSAGES[last_asked])
+
+#     # ✅ Find next missing field
+#     for field in FIELD_ORDER:
+#         if not session.get(field):
+#             session["last_asked_field"] = field
+
+#             ask = random.choice(ASK_MESSAGES[field])
+
+#             if acknowledgement:
+#                 return {
+#                     "reply": f"{acknowledgement}\n\n{ask}"
+#                 }
+
+#             return {"reply": ask}
+
+#     # Nothing missing
+#     return {"reply": None}
+
+async def sales_agent(session: dict):
+    FIELD_ORDER = [
+        "loan_amount",
+        "tenure_months",
+        "purpose",
+        "salary",
+        "salary_slip_uploaded",
+        "phone",
+        "pan"
+    ]
+
+    FIELD_LABELS = {
+        "loan_amount": "loan amount",
+        "tenure_months": "loan tenure",
+        "purpose": "loan purpose",
+        "salary": "monthly salary",
+        "salary_slip_uploaded": "salary slip",
+        "phone": "phone number",
+        "pan": "PAN number"
+    }
+
+    # Step 1: find next missing field (ORDERED)
+    next_field = None
+    for field in FIELD_ORDER:
+        if not session.get(field):
+            next_field = field
+            break
+
+    # Nothing missing → move to next agent
+    if not next_field:
+        return {"reply": None}
+
+    last_asked = session.get("last_asked_field")
+
+    # Step 2: build acknowledgement
+    acknowledgement = ""
+    if last_asked and session.get(last_asked):
+        acknowledgement = f"Thanks for sharing your {FIELD_LABELS[last_asked]}. "
+
+    # Step 3: LLM prompt (VERY CONSTRAINED)
+    prompt = f"""
+You are a loan sales executive.
+
+Ask ONLY ONE question.
+Ask specifically for: {FIELD_LABELS[next_field]}.
+
+Rules:
+- Be polite and concise
+- Do not ask multiple questions
+- Do not mention approval, rejection, or eligibility
+- Do not repeat previously asked questions
+"""
+
+    response = client.models.generate_content(
+     model="gemini-2.0-flash",
+    contents=prompt
+)
+
+    # Step 4: persist state
+    session["last_asked_field"] = next_field
+
+    reply = response.text.strip()
+
+    if acknowledgement:
+        reply = acknowledgement + "\n\n" + reply
+
+    return {"reply": reply}
+
+# ---------------- KYC AGENT ----------------
+async def verification_agent(session):
+    for c in CRM:
+        if c["phone"] == session["phone"] and c["pan"] == session["pan"]:
+            return {
+    "verified": True,
+    "mock_score": c["mock_score"],
+    "customer_profile": c
+}
+
+    return {
+    "verified": False,
+    "reason": (
+        f"I couldn’t find a matching record for the phone number **{session['phone']}** "
+        f"with PAN **{session['pan']}** in our system. "
+        "Please double-check the details and try again."
+    )
+}
+
+# ---------------- SALARY SLIP AGENT ----------------
+import random
+
+INVALID_SLIP_MESSAGES = [
+    "I’m sorry 😕 — we couldn’t verify your salary slip.",
+    "The uploaded salary slip doesn’t meet our verification requirements.",
+    "We’re unable to validate the income document you shared."
+]
+
+async def salary_slip_agent(session):
+    if session.get("salary_slip_verified"):
+        return {"verified": True}
+
+    if session.get("salary_slip_invalid"):
+        return {
+            "verified": False,
+            "final_reject": True,
+            "reason": random.choice(INVALID_SLIP_MESSAGES)
+        }
+
+    return {
+        "verified": False,
+        "final_reject": False,
+        "reason": "I’ll need your salary slip for verification. Kindly upload it."
+    }
+
+
+
+
+
+# ---------------- UNDERWRITING ----------------
+async def underwriting_agent(session):
+    score = session["mock_score"]
+
+    if score < 700:
+        return {
+            "decision": "rejected",
+            "reason": (
+                "I checked your credit profile carefully. "
+                "At the moment, your credit score is below our minimum eligibility criteria. "
+                "Improving your score can significantly increase approval chances in the future."
+            )
+        }
+
+
+
+    rate = calculate_final_interest_rate(session["purpose"], score)
+
+    emi = compute_emi(
+        session["loan_amount"],
+        session["tenure_months"],
+        rate
+    )
+
+    foir = calculate_foir(emi, session["salary"])
+
+    if foir > 0.20:
+     return {
+        "decision": "rejected",
+        "reason": (
+            "I checked your income details carefully. "
+            "At the moment, the monthly EMI comes to more than 20% of your salary, "
+            "which could make repayments stressful. "
+            "To keep things comfortable for you, I won’t be able to approve this loan right now."
+        )
+    }
+
+    return {
+        "decision": "approved",
+        "emi": emi,
+        "interest_rate": rate
+    }
+
+# ---------------- SANCTION ----------------
+async def sanction_agent(session, session_id):
+    return {"pdf_path": generate_sanction_pdf(session_id, session)}
