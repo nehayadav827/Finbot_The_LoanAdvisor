@@ -1,157 +1,77 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import Optional
+import uvicorn
+import uuid
+import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
+from agents.master_agent import MasterAgent
+from services.session_store import SessionStore
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel
-import uuid, os
-print("GOOGLE_API_KEY loaded:", bool(os.getenv("GOOGLE_API_KEY")))
+app = FastAPI(title="FinBot API", version="1.0.0")
 
-# from google import genai
-# import os
+# In production set ALLOWED_ORIGINS env var on Render to your Vercel URL
+# e.g. ALLOWED_ORIGINS=https://finbot-xyz.vercel.app
+raw_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:3000")
+origins = [o.strip() for o in raw_origins.split(",")]
 
-
-# # Get the key from the environment variable you verified is loaded
-# api_key = os.getenv("GOOGLE_API_KEY")
-
-# if not api_key:
-#     raise ValueError("GOOGLE_API_KEY not found in environment variables")
-
-# client = genai.Client(api_key=api_key)
-
-# # Print all available models
-# # Change supported_methods to supported_actions
-# for model in client.models.list():
-#     print(f"Name: {model.name} | Actions: {model.supported_actions}")
-import random
-from workers import APPROVAL_MESSAGES
-import asyncio
-
-from workers import salary_slip_agent
-
-
-from intent_llm import extract_intent
-from workers import (
-    sales_agent,
-    verification_agent,
-    underwriting_agent,
-    sanction_agent
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-app = FastAPI(title="FinBot")
-SESSIONS = {}
+session_store = SessionStore()
 
 class ChatRequest(BaseModel):
-    text: str
-    session_id: str | None = None
+    session_id: Optional[str] = None
+    message: str
 
-@app.post("/api/message")
+class ChatResponse(BaseModel):
+    session_id: str
+    reply: str
+    stage: str
+    loan_data: Optional[dict] = None
+    sanction_url: Optional[str] = None
+
+@app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     session_id = req.session_id or str(uuid.uuid4())
-    session = SESSIONS.setdefault(session_id, {})
+    session = session_store.get_or_create(session_id)
+    
+    agent = MasterAgent(session, session_store)
+    result = await agent.process(req.message)
+    
+    return ChatResponse(
+        session_id=session_id,
+        reply=result["reply"],
+        stage=result["stage"],
+        loan_data=result.get("loan_data"),
+        sanction_url=result.get("sanction_url"),
+    )
 
-    # ---------------- Extract intent ----------------
-    # ---------------- Extract intent ----------------
-    if req.text != "__continue__":
-       extracted = extract_intent(req.text)
-       session.update({k: v for k, v in extracted.items() if v is not None})
+@app.get("/session/{session_id}")
+def get_session(session_id: str):
+    session = session_store.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return session
 
+@app.delete("/session/{session_id}")
+def reset_session(session_id: str):
+    session_store.delete(session_id)
+    return {"status": "reset"}
 
-    # ---------------- SALES AGENT ----------------
-    sales = await sales_agent(session)
-    if sales.get("reply"):
-        await asyncio.sleep(0.8)
-        return {
-            "reply": sales["reply"],
-            "session_id": session_id
-        }
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
-    # =====================================================
-    # 🔽 ADD THIS BLOCK EXACTLY HERE
-    # ---------------- SALARY SLIP (ALWAYS REQUIRED) ----------------
-    salary_slip = await salary_slip_agent(session)
-
-    if not salary_slip["verified"]:
-
-    # 🚫 FINAL REJECTION CASE
-        if salary_slip.get("final_reject"):
-           return {
-            "reply": (
-                f"{salary_slip['reason']}\n\n"
-                "Without a valid salary slip, we won’t be able to proceed with this loan application.\n\n"
-                "You can reapply anytime with a valid income document."
-            ),
-            "session_id": session_id
-        }
-
-    # ⏳ Ask for upload
-        return {
-        "reply": salary_slip["reason"],
-        "need_salary_slip": True,
-        "session_id": session_id
-    }
-
-    # =====================================================
-
-    # ---------------- KYC ----------------
-    ver = await verification_agent(session)
-    if not ver["verified"]:
-        await asyncio.sleep(0.8)
-        return {
-            "reply": ver["reason"],
-            "session_id": session_id
-        }
-
-    session["mock_score"] = ver["mock_score"]
-    session["customer_profile"] = ver["customer_profile"]
-
-    # ---------------- UNDERWRITING ----------------
-    uw = await underwriting_agent(session)
-    if uw["decision"] == "rejected":
-        await asyncio.sleep(0.8)
-        return {
-            "reply": uw["reason"],
-            "session_id": session_id
-        }
-
-    session.update(uw)
-
-    # ---------------- SANCTION ----------------
-    sanction = await sanction_agent(session, session_id)
-    await asyncio.sleep(0.8)
-
-    return {
-        "reply": random.choice(APPROVAL_MESSAGES),
-        "emi": session["emi"],
-        "interest_rate": session["interest_rate"],
-        "pdf": f"/api/pdf/{os.path.basename(sanction['pdf_path'])}",
-        "session_id": session_id
-    }
-
-
-
-@app.post("/api/upload-salary-slip")
-async def upload_salary_slip(session_id: str):
-    if session_id not in SESSIONS:
-        raise HTTPException(400, "Invalid session")
-
-    session = SESSIONS[session_id]
-
-    session["salary_slip_uploaded"] = True
-    session["salary_slip_verified"] = False
-    session["salary_slip_invalid"] = True   # MATCH AGENT
-
-    return {
-        "status": "invalid",
-        "reason": "Salary slip could not be verified"
-    }
-
-
-
-@app.get("/api/pdf/{file}")
-async def pdf(file: str):
-    path = f"backend/static_pdfs/{file}"
-    if not os.path.exists(path):
-        raise HTTPException(404, "PDF not found")
-    return FileResponse(path, media_type="application/pdf")
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
